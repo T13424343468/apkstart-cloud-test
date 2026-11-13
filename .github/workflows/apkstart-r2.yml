@@ -1,0 +1,106 @@
+name: experiment-apkstart-r2
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  r2-headless-engine:
+    name: 第二轮：ApkStart 引擎口径无头实测（Windows 云端）
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: A. ApkStart 壳层自身无头启动探针（Electron GUI 能不能在云台起）
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path evidence-r2 | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/RoutineMiku/apkstart/releases/download/v0.2.5/ApkStart-v0.2.5-win64-portable.zip" -OutFile ApkStart.zip
+          Expand-Archive -Path ApkStart.zip -DestinationPath apkstart-app -Force
+          # 无头启动 + --smoke 自截取证
+          $p = Start-Process -FilePath "apkstart-app/ApkStart.exe" -ArgumentList '--smoke','evidence-r2/00_shell_smoke.png' -PassThru
+          Start-Sleep -Seconds 60
+          if ($p.HasExited) { "壳层进程已退出 exit=$($p.ExitCode)" | Out-File evidence-r2/00_shell.txt } else { "壳层进程存活60秒 pid=$($p.Id)" | Out-File evidence-r2/00_shell.txt }
+          "smoke截图存在: $(Test-Path evidence-r2/00_shell_smoke.png)" | Out-File evidence-r2/00_shell.txt -Append
+          (Get-ChildItem "$env:APPDATA\apkstart" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName | Out-String) >> evidence-r2/00_shell.txt
+          Get-Content evidence-r2/00_shell.txt
+
+      - name: B. 部署其同口径引擎与镜像（官方源：emulator + Android 14 GPlay x86_64）
+        shell: pwsh
+        run: |
+          $sdk = "$env:RUNNER_TEMP\asdk"
+          New-Item -ItemType Directory -Force -Path $sdk\cmdline-tools | Out-Null
+          Invoke-WebRequest -Uri "https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip" -OutFile clt.zip
+          Expand-Archive clt.zip -DestinationPath "$sdk\cmdline-tools" -Force
+          Rename-Item "$sdk\cmdline-tools\cmdline-tools" tools
+          $env:JAVA_HOME = $env:JAVA_HOME_17_X64
+          $yes = 'y'
+          "$yes`n" | & "$sdk\cmdline-tools\tools\bin\sdkmanager.bat" --licenses
+          & "$sdk\cmdline-tools\tools\bin\sdkmanager.bat" "emulator" "platform-tools" "system-images;android-34;google_apis_playstore;x86_64"
+          & "$sdk\cmdline-tools\tools\bin\avdmanager.bat" create avd -n apkstart_r2 -k "system-images;android-34;google_apis_playstore;x86_64" -d pixel
+          "SDK 部署完成: $(Test-Path "$sdk\system-images\android-34\google_apis_playstore\x86_64\system.img")" | Out-File evidence-r2/10_sdk.txt -Append
+          "SDKROOT=$sdk" | Out-File $env:GITHUB_ENV -Append
+
+      - name: C. 无头拉起引擎（-no-window，WHPX 优先，失败回退纯软件）
+        shell: pwsh
+        run: |
+          $env:ANDROID_SDK_ROOT = $env:SDKROOT
+          $env:ANDROID_AVD_HOME = "$env:USERPROFILE\.android\avd"
+          $emu = "$env:SDKROOT\emulator\emulator.exe"
+          & $emu -avd apkstart_r2 -no-window -gpu swiftshader_indirect -no-snapshot -no-audio -no-boot-anim -no-metrics -memory 4096 -cores 2 -accel whpx *>> evidence-r2/20_emu_whpx.log
+          Start-Sleep -Seconds 5
+          if (-not (Get-Process emulator -ErrorAction SilentlyContinue)) {
+            "WHPX 拉起失败，回退纯软件模拟" | Out-File evidence-r2/20_engine.txt
+            $proc = Start-Process -FilePath $emu -ArgumentList '-avd','apkstart_r2','-no-window','-gpu','swiftshader_indirect','-no-snapshot','-no-audio','-no-boot-anim','-no-metrics','-memory','4096','-cores','2','-accel','off' -PassThru -RedirectStandardOutput evidence-r2/20_emu_tcg_out.log -RedirectStandardError evidence-r2/20_emu_tcg_err.log
+          } else {
+            "WHPX 模式模拟器进程存活" | Out-File evidence-r2/20_engine.txt
+          }
+          Get-Content evidence-r2/20_engine.txt
+
+      - name: D. adb 连通 + 开机判定 + 装 TaoZip + 截屏 + 界面树
+        shell: bash
+        run: |
+          set -uo pipefail
+          ADB="$SDKROOT/platform-tools/adb.exe"
+          "$ADB" start-server
+          if ! timeout 120 "$ADB" wait-for-device; then echo "RESULT: adb 连不上（无头拉起失败）" | tee evidence-r2/40_result.txt; exit 0; fi
+          BOOTED=0
+          for i in $(seq 1 120); do
+            B=$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            if [ "$B" = "1" ]; then BOOTED=1; break; fi
+            sleep 5
+          done
+          if [ "$BOOTED" != "1" ]; then echo "RESULT: 600 秒未完成开机（超时）" | tee evidence-r2/40_result.txt; "$ADB" exec-out screencap -p > evidence-r2/41_timeout.png || true; exit 0; fi
+          echo "RESULT: 引擎无头开机成功（WHPX 或纯软件），adb 可连可操控" | tee evidence-r2/40_result.txt
+          "$ADB" shell getprop ro.build.version.release >> evidence-r2/40_result.txt
+          # 编译并安装 TaoZip 安卓包（真实交付对象）
+          dotnet workload install android
+          dotnet publish ZipGo/ui/TaoZip.UI.Android/TaoZip.UI.Android.csproj -c Release -p:RuntimeIdentifier=android-x64
+          APK=$(find ZipGo/ui -name "*-Signed.apk" -not -path "*/obj/*" 2>/dev/null | head -1)
+          if [ -n "${APK:-}" ]; then
+            "$ADB" install -r "$APK" && echo "TaoZip 安装成功: $APK" >> evidence-r2/40_result.txt
+            "$ADB" shell monkey -p com.taozip.app -c android.intent.category.LAUNCHER 1
+            sleep 15
+            "$ADB" exec-out screencap -p > evidence-r2/50_taozip_screen.png || true
+            "$ADB" shell uiautomator dump /sdcard/ui.xml && "$ADB" pull /sdcard/ui.xml evidence-r2/50_ui.xml || true
+          else
+            echo "APK 构建失败，仅保留引擎层证据" >> evidence-r2/40_result.txt
+          fi
+          "$ADB" exec-out screencap -p > evidence-r2/51_engine_screen.png || true
+          cat evidence-r2/40_result.txt
+
+      - name: E. 存档证据
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apkstart-r2-evidence
+          path: evidence-r2/
