@@ -39,15 +39,18 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path evidence-r2 | Out-Null
-          $env:ANDROID_SDK_ROOT = $env:SDKROOT
+          $env:ANDROID_SDK_ROOT = ($env:SDKROOT -replace '/','\\')
           $env:ANDROID_AVD_HOME = "$env:USERPROFILE\.android\avd"
           $emu = "$env:SDKROOT\emulator\emulator.exe"
+          $adbExe = "$env:SDKROOT\platform-tools\adb.exe"
           $proc = Start-Process -FilePath $emu -ArgumentList '-avd','apkstart_r2','-no-window','-gpu','swiftshader_indirect','-no-snapshot','-no-audio','-no-boot-anim','-no-metrics','-memory','4096','-cores','2','-accel','whpx' -PassThru -RedirectStandardOutput evidence-r2/20_emu_out.log -RedirectStandardError evidence-r2/20_emu_err.log
           Start-Sleep -Seconds 20
           if ($proc.HasExited) {
             "WHPX 拉起失败(exit=$($proc.ExitCode))，回退纯软件模拟(-accel off)" | Out-File evidence-r2/20_engine.txt
             Get-Content evidence-r2/20_emu_err.log | Out-File evidence-r2/20_engine.txt -Append
             $proc = Start-Process -FilePath $emu -ArgumentList '-avd','apkstart_r2','-no-window','-gpu','swiftshader_indirect','-no-snapshot','-no-audio','-no-boot-anim','-no-metrics','-memory','4096','-cores','2','-accel','off' -PassThru -RedirectStandardOutput evidence-r2/21_emu_out.log -RedirectStandardError evidence-r2/21_emu_err.log
+            Start-Sleep -Seconds 20
+            if ($proc.HasExited) { "纯软件模拟也退出(exit=$($proc.ExitCode))" | Out-File evidence-r2/21_engine.txt } else { "纯软件模拟进程存活 pid=$($proc.Id)" | Out-File evidence-r2/21_engine.txt }
           } else {
             "WHPX 模式模拟器进程存活 pid=$($proc.Id)" | Out-File evidence-r2/20_engine.txt
           }
