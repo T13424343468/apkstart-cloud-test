@@ -38,6 +38,7 @@ jobs:
       - name: 无头拉起引擎（-no-window，WHPX 优先，失败回退纯软件）
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force -Path evidence-r2 | Out-Null
           $env:ANDROID_SDK_ROOT = $env:SDKROOT
           $env:ANDROID_AVD_HOME = "$env:USERPROFILE\.android\avd"
           $emu = "$env:SDKROOT\emulator\emulator.exe"
