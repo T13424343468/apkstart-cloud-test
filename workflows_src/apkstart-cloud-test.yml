@@ -1,0 +1,93 @@
+name: experiment-apkstart-cloud-test
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  apkstart-experiment:
+    name: 实验版：ApkStart 能否当模拟器做云端无头真机测试
+    runs-on: windows-latest
+    timeout-minutes: 85
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境底账（虚拟化/权限基线）
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path evidence-apkstart | Out-Null
+          "===== Windows 版本与架构 =====" | Out-File evidence-apkstart/00_env.txt
+          (Get-ComputerInfo -Property OsName, OsVersion, OsArchitecture | Out-String) >> evidence-apkstart/00_env.txt
+          "===== Hyper-V 功能状态 =====" | Out-File evidence-apkstart/00_env.txt -Append
+          try { (Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction Stop | Out-String) >> evidence-apkstart/00_env.txt } catch { "查询失败: $_" >> evidence-apkstart/00_env.txt }
+          "===== 虚拟机平台（WHPX 基座） =====" | Out-File evidence-apkstart/00_env.txt -Append
+          try { (Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -ErrorAction Stop | Out-String) >> evidence-apkstart/00_env.txt } catch { "查询失败: $_" >> evidence-apkstart/00_env.txt }
+          "===== 管理员权限 =====" | Out-File evidence-apkstart/00_env.txt -Append
+          ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) >> evidence-apkstart/00_env.txt
+          Get-Content evidence-apkstart/00_env.txt
+
+      - name: 下载并解压 ApkStart 便携版
+        shell: pwsh
+        run: |
+          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/RoutineMiku/apkstart/releases/latest"
+          "Latest release: $($rel.tag_name) | assets: $($rel.assets.name -join ', ')" | Out-File evidence-apkstart/10_download.txt
+          $asset = $rel.assets | Where-Object { $_.name -match 'zip' } | Select-Object -First 1
+          if (-not $asset) { throw "未找到 zip 资产" }
+          "选中: $($asset.name) ($([math]::Round($asset.size/1MB,1)) MB)" | Out-File evidence-apkstart/10_download.txt -Append
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile ApkStart.zip
+          Expand-Archive -Path ApkStart.zip -DestinationPath apkstart-app -Force
+          (Get-ChildItem apkstart-app -Recurse -Depth 2 | Select-Object -ExpandProperty FullName) >> evidence-apkstart/10_download.txt
+
+      - name: 定位其自带运行时（adb / emulator / 系统镜像）
+        shell: pwsh
+        run: |
+          $adb = Get-ChildItem -Recurse -Filter "adb.exe" -Path apkstart-app | Select-Object -First 1
+          $emu = Get-ChildItem -Recurse -Filter "emulator.exe" -Path apkstart-app | Select-Object -First 1
+          $imgs = Get-ChildItem -Recurse -Filter "system.img" -Path apkstart-app
+          ("adb=" + $(if($adb){$adb.FullName}else{'未内置'})) | Out-File evidence-apkstart/20_runtime.txt
+          ("emulator=" + $(if($emu){$emu.FullName}else{'未内置'})) | Out-File evidence-apkstart/20_runtime.txt -Append
+          ("system.img 数量=" + $imgs.Count) | Out-File evidence-apkstart/20_runtime.txt -Append
+          $imgs | ForEach-Object { ("  " + $_.FullName + " " + [math]::Round($_.Length/1GB,2) + "GB") >> evidence-apkstart/20_runtime.txt }
+          Get-Content evidence-apkstart/20_runtime.txt
+          "ADB_DIR=$(if($adb){$adb.DirectoryName}else{''})" | Out-File $env:GITHUB_ENV -Append
+          "EMU_EXE=$(if($emu){$emu.FullName}else{''})" | Out-File $env:GITHUB_ENV -Append
+          "IMG_FILE=$(if($imgs.Count -gt 0){$imgs[0].FullName}else{''})" | Out-File $env:GITHUB_ENV -Append
+
+      - name: 关键实验 · 其镜像无头拉起（-no-window 等价现有 CI 打法）
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrEmpty($env:EMU_EXE) -or -not (Test-Path $env:EMU_EXE)) {
+            "便携版无 emulator.exe：其口径是壳层自管运行时，无头等价路径不存在，实验记失败证据" | Out-File evidence-apkstart/30_boot.txt
+            exit 0
+          }
+          "EMU_EXE=$env:EMU_EXE" | Out-File evidence-apkstart/30_boot.txt
+          & "$env:EMU_EXE" -version 2>&1 >> evidence-apkstart/30_boot.txt
+          $imgDir = Split-Path $env:IMG_FILE
+          (Get-ChildItem $imgDir -Recurse -Depth 1 | Select-Object FullName | Out-String) >> evidence-apkstart/30_boot.txt
+          $p = Start-Process -FilePath $env:EMU_EXE -ArgumentList @('-no-window','-gpu','swiftshader_indirect','-no-snapshot-save','-noaudio','-no-boot-anim','-memory','4096','-avd','apkstart_probe') -PassThru -RedirectStandardOutput evidence-apkstart/30_emulator_out.txt -RedirectStandardError evidence-apkstart/30_emulator_err.txt
+          Start-Sleep -Seconds 45
+          if ($p.HasExited) { "emulator 45秒内退出 exit=$($p.ExitCode)" | Out-File evidence-apkstart/30_boot.txt -Append } else { "emulator 存活45秒 pid=$($p.Id)" | Out-File evidence-apkstart/30_boot.txt -Append }
+          Get-Content evidence-apkstart/30_boot.txt, evidence-apkstart/30_emulator_err.txt -ErrorAction SilentlyContinue
+
+      - name: 若起得来 · adb 连通 + 截屏取证
+        shell: bash
+        run: |
+          set -uo pipefail
+          if [ -z "${ADB_DIR:-}" ]; then echo "无 adb 可用，实验收束" > evidence-apkstart/40_result.txt; exit 0; fi
+          ADB="$ADB_DIR/adb.exe"
+          "$ADB" kill-server || true
+          "$ADB" start-server
+          if timeout 240 "$ADB" wait-for-device; then
+            echo "RESULT: adb 已连设备（无头启动成功实证）" | tee -a evidence-apkstart/40_result.txt
+            "$ADB" shell getprop sys.boot_completed >> evidence-apkstart/40_result.txt || true
+            "$ADB" exec-out screencap -p > evidence-apkstart/41_headless_screen.png || true
+          else
+            echo "RESULT: adb 连不上设备（无头拉起失败实锤）" | tee -a evidence-apkstart/40_result.txt
+          fi
+          cat evidence-apkstart/40_result.txt
+
+      - name: 存档证据
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apkstart-experiment-evidence
+          path: evidence-apkstart/
